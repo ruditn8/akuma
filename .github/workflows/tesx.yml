@@ -1,27 +1,19 @@
-name: SSH Ngrok with Telegram Notify
+name: SSH Ngrok Debug
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
+on: [workflow_dispatch]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Setup SSH Server
+    - name: Check secrets
       run: |
-        # SSH sudah terinstall, tinggal configure
-        sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-        sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-        sudo systemctl restart ssh
-        echo "✅ SSH Server configured"
-    
-    - name: Set User Password
-      run: |
-        echo "runner:${{ secrets.SSH_PASSWORD }}" | sudo chpasswd
-        echo "✅ Password set for user: runner"
+        if [ -z "${{ secrets.NGROK_TOKEN }}" ]; then
+          echo "❌ NGROK_TOKEN is empty!"
+          exit 1
+        fi
+        echo "✅ NGROK_TOKEN exists (length: ${#{{ secrets.NGROK_TOKEN }}})"
     
     - name: Install ngrok
       run: |
@@ -31,129 +23,27 @@ jobs:
           | sudo tee /etc/apt/sources.list.d/ngrok.list
         sudo apt-get update -qq
         sudo apt-get install -y ngrok
-        echo "✅ Ngrok installed"
     
-    - name: Configure ngrok authtoken
+    - name: Test ngrok config
       run: |
         ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
         ngrok config check
-        echo "✅ Ngrok configured"
+        ngrok version
     
-    - name: Start ngrok tunnel
+    - name: Setup SSH
       run: |
-        # Start ngrok dengan output ke file
-        ngrok tcp 22 --log=stdout --log-level=info > ngrok.log 2>&1 &
-        NGROK_PID=$!
-        
-        echo "⏳ Waiting for ngrok to initialize..."
-        sleep 15
-        
-        # Verify ngrok masih running
-        if ! ps -p $NGROK_PID > /dev/null; then
-          echo "❌ Ngrok process died!"
-          echo "=== Ngrok Log ==="
-          cat ngrok.log
-          exit 1
-        fi
-        
-        echo "✅ Ngrok running (PID: $NGROK_PID)"
+        echo "runner:TestPass123" | sudo chpasswd
+        sudo systemctl restart ssh
     
-    - name: Get tunnel URL
-      id: tunnel
+    - name: Start ngrok with verbose logging
       run: |
-        # Retry mechanism
-        for i in {1..15}; do
-          echo "Attempt $i/15..."
-          
-          RESPONSE=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null || echo "")
-          
-          if [ -n "$RESPONSE" ]; then
-            NGROK_URL=$(echo "$RESPONSE" | jq -r '.tunnels[0].public_url // empty')
-            
-            if [ -n "$NGROK_URL" ]; then
-              echo "✅ Got tunnel URL: $NGROK_URL"
-              
-              NGROK_HOST=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f1)
-              NGROK_PORT=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f2)
-              
-              echo "NGROK_HOST=$NGROK_HOST" >> $GITHUB_OUTPUT
-              echo "NGROK_PORT=$NGROK_PORT" >> $GITHUB_OUTPUT
-              echo "NGROK_URL=$NGROK_URL" >> $GITHUB_OUTPUT
-              
-              exit 0
-            fi
-          fi
-          
-          sleep 2
-        done
+        ngrok tcp 22 --log=stdout --log-level=debug &
+        sleep 20
         
-        echo "❌ Failed to get tunnel URL after 15 attempts"
-        echo "=== Ngrok API Response ==="
-        curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null | jq . || echo "No response"
-        echo "=== Ngrok Log ==="
-        cat ngrok.log
-        exit 1
-    
-    - name: Display connection info
-      run: |
-        echo "=========================================="
-        echo "🚀 SSH Tunnel Active!"
-        echo "=========================================="
-        echo "Host: ${{ steps.tunnel.outputs.NGROK_HOST }}"
-        echo "Port: ${{ steps.tunnel.outputs.NGROK_PORT }}"
-        echo "User: runner"
-        echo ""
-        echo "📋 Connect with:"
-        echo "ssh runner@${{ steps.tunnel.outputs.NGROK_HOST }} -p ${{ steps.tunnel.outputs.NGROK_PORT }}"
-        echo "=========================================="
-        echo "⏰ Active until: $(date -d '+5 hours 50 minutes' '+%Y-%m-%d %H:%M:%S UTC')"
-        echo "=========================================="
-    
-    - name: Send Telegram notification
-      if: success() && secrets.TELEGRAM_BOT_TOKEN != ''
-      run: |
-        MESSAGE="🚀 <b>SSH Server Ready!</b>%0A%0A"
-        MESSAGE="${MESSAGE}🖥 <b>Host:</b> <code>${{ steps.tunnel.outputs.NGROK_HOST }}</code>%0A"
-        MESSAGE="${MESSAGE}🔌 <b>Port:</b> <code>${{ steps.tunnel.outputs.NGROK_PORT }}</code>%0A"
-        MESSAGE="${MESSAGE}👤 <b>User:</b> <code>runner</code>%0A%0A"
-        MESSAGE="${MESSAGE}📋 <b>Command:</b>%0A<code>ssh runner@${{ steps.tunnel.outputs.NGROK_HOST }} -p ${{ steps.tunnel.outputs.NGROK_PORT }}</code>%0A%0A"
-        MESSAGE="${MESSAGE}⏰ Active for ~5h 50m"
+        echo "=== Ngrok Process ==="
+        ps aux | grep ngrok
         
-        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-          -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
-          -d "text=$MESSAGE" \
-          -d "parse_mode=HTML"
+        echo "=== Ngrok API ==="
+        curl -v http://127.0.0.1:4040/api/tunnels
         
-        echo "✅ Telegram notification sent!"
-      continue-on-error: true
-    
-    - name: Keep tunnel alive
-      run: |
-        echo "🔄 Keeping tunnel alive for 5h 50m..."
-        
-        END_TIME=$(($(date +%s) + 21000))
-        
-        while [ $(date +%s) -lt $END_TIME ]; do
-          REMAINING=$((($END_TIME - $(date +%s)) / 60))
-          echo "[$(date '+%H:%M:%S')] ✅ Tunnel active - ${REMAINING} minutes remaining"
-          
-          # Health check setiap loop
-          if ! curl -s http://127.0.0.1:4040/api/tunnels | jq -e '.tunnels[0]' > /dev/null 2>&1; then
-            echo "⚠️ Tunnel lost! Attempting restart..."
-            pkill ngrok
-            sleep 5
-            ngrok tcp 22 --log=stdout > ngrok.log 2>&1 &
-            sleep 10
-          fi
-          
-          sleep 300  # Check every 5 minutes
-        done
-        
-        echo "⏰ Session completed"
-    
-    - name: Cleanup
-      if: always()
-      run: |
-        echo "🧹 Cleaning up..."
-        pkill ngrok || true
-        echo "✅ Done"
+        sleep 60
