@@ -1,4 +1,4 @@
-name: SSH Ngrok 24/7
+name: SSH Ngrok Fixed
 
 on:
   workflow_dispatch:
@@ -14,29 +14,68 @@ jobs:
         run: |
           echo "runner:Password123" | sudo chpasswd
           sudo systemctl start ssh
+          echo "✅ SSH started"
       
       - name: Install ngrok
         run: |
           sudo snap install ngrok
+          echo "✅ Ngrok installed"
+      
+      - name: Create ngrok config directory
+        run: |
+          mkdir -p $HOME/.config/ngrok
+          chmod 755 $HOME/.config/ngrok
+          echo "✅ Config directory created"
       
       - name: Configure ngrok
         run: |
           ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
+          ngrok config check
+          echo "✅ Ngrok configured"
       
       - name: Start tunnel
         run: |
           ngrok tcp 22 > ngrok.log 2>&1 &
+          echo "⏳ Waiting for tunnel..."
           sleep 15
           
-          URL=$(curl -s http://127.0.0.1:4040/api/tunnels | grep -o '"public_url":"[^"]*' | cut -d'"' -f4)
+          echo "=== Checking ngrok process ==="
+          ps aux | grep ngrok | grep -v grep || echo "No ngrok process"
+          
+          echo ""
+          echo "=== Getting tunnel info ==="
+          RESPONSE=$(curl -s http://127.0.0.1:4040/api/tunnels)
+          echo "$RESPONSE"
+          
+          URL=$(echo "$RESPONSE" | grep -o '"public_url":"[^"]*' | cut -d'"' -f4)
+          
+          if [ -z "$URL" ]; then
+            echo "❌ Failed to get tunnel URL"
+            echo "=== Ngrok log ==="
+            cat ngrok.log
+            exit 1
+          fi
+          
           HOST=$(echo $URL | sed 's|tcp://||' | cut -d: -f1)
           PORT=$(echo $URL | sed 's|tcp://||' | cut -d: -f2)
           
+          echo ""
           echo "========================================"
-          echo "SSH Ready!"
+          echo "🚀 SSH Tunnel Active!"
           echo "========================================"
+          echo "Host: $HOST"
+          echo "Port: $PORT"
+          echo "User: runner"
+          echo "Pass: Password123"
+          echo ""
+          echo "Command:"
           echo "ssh runner@$HOST -p $PORT"
-          echo "Password: Password123"
           echo "========================================"
           
           sleep 21000
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill ngrok || true
+          echo "✅ Cleanup done"
