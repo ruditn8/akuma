@@ -10,163 +10,150 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Download and setup ngrok
-      run: |
-        wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
-        tar xzf ngrok-v3-stable-linux-amd64.tgz
-        chmod +x ngrok
-        sudo mv ngrok /usr/local/bin/
-    
-    - name: Configure ngrok
-      run: |
-        mkdir -p ~/.ngrok2
-        cat > ~/.ngrok2/ngrok.yml << EOF
-        version: "2"
-        authtoken: ${{ secrets.NGROK_TOKEN }}
-        EOF
-        
-        # Verify configuration
-        ngrok config check
-    
     - name: Setup SSH Server
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y openssh-server jq curl
-        
-        # Configure SSH
+        # SSH sudah terinstall, tinggal configure
         sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
         sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-        
-        # Start SSH
-        sudo systemctl start ssh
-        sudo systemctl enable ssh
-        sudo systemctl status ssh --no-pager
+        sudo systemctl restart ssh
+        echo "✅ SSH Server configured"
     
     - name: Set User Password
       run: |
         echo "runner:${{ secrets.SSH_PASSWORD }}" | sudo chpasswd
         echo "✅ Password set for user: runner"
     
+    - name: Install ngrok
+      run: |
+        curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+          | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+        echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+          | sudo tee /etc/apt/sources.list.d/ngrok.list
+        sudo apt-get update -qq
+        sudo apt-get install -y ngrok
+        echo "✅ Ngrok installed"
+    
+    - name: Configure ngrok authtoken
+      run: |
+        ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
+        ngrok config check
+        echo "✅ Ngrok configured"
+    
     - name: Start ngrok tunnel
       run: |
-        # Start ngrok in background with log file
-        ngrok tcp 22 --log=stdout > ngrok.log &
+        # Start ngrok dengan output ke file
+        ngrok tcp 22 --log=stdout --log-level=info > ngrok.log 2>&1 &
         NGROK_PID=$!
         
-        echo "Waiting for ngrok to initialize..."
+        echo "⏳ Waiting for ngrok to initialize..."
         sleep 15
         
-        # Check if ngrok is still running
-        if ! kill -0 $NGROK_PID 2>/dev/null; then
-          echo "❌ Ngrok failed to start!"
+        # Verify ngrok masih running
+        if ! ps -p $NGROK_PID > /dev/null; then
+          echo "❌ Ngrok process died!"
           echo "=== Ngrok Log ==="
           cat ngrok.log
           exit 1
         fi
         
-        echo "✅ Ngrok process running (PID: $NGROK_PID)"
+        echo "✅ Ngrok running (PID: $NGROK_PID)"
     
-    - name: Get tunnel info and notify
+    - name: Get tunnel URL
+      id: tunnel
       run: |
-        # Retry logic untuk mendapatkan tunnel info
-        MAX_RETRIES=10
-        RETRY_COUNT=0
-        
-        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-          TUNNEL_INFO=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null)
+        # Retry mechanism
+        for i in {1..15}; do
+          echo "Attempt $i/15..."
           
-          if [ -n "$TUNNEL_INFO" ] && echo "$TUNNEL_INFO" | jq -e '.tunnels[0]' > /dev/null 2>&1; then
-            NGROK_URL=$(echo "$TUNNEL_INFO" | jq -r '.tunnels[0].public_url')
+          RESPONSE=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null || echo "")
+          
+          if [ -n "$RESPONSE" ]; then
+            NGROK_URL=$(echo "$RESPONSE" | jq -r '.tunnels[0].public_url // empty')
             
-            if [ "$NGROK_URL" != "null" ] && [ -n "$NGROK_URL" ]; then
-              break
+            if [ -n "$NGROK_URL" ]; then
+              echo "✅ Got tunnel URL: $NGROK_URL"
+              
+              NGROK_HOST=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f1)
+              NGROK_PORT=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f2)
+              
+              echo "NGROK_HOST=$NGROK_HOST" >> $GITHUB_OUTPUT
+              echo "NGROK_PORT=$NGROK_PORT" >> $GITHUB_OUTPUT
+              echo "NGROK_URL=$NGROK_URL" >> $GITHUB_OUTPUT
+              
+              exit 0
             fi
           fi
           
-          RETRY_COUNT=$((RETRY_COUNT + 1))
-          echo "Retry $RETRY_COUNT/$MAX_RETRIES..."
-          sleep 3
+          sleep 2
         done
         
-        if [ "$NGROK_URL" = "null" ] || [ -z "$NGROK_URL" ]; then
-          echo "❌ Failed to get ngrok URL!"
-          echo "=== Ngrok API Response ==="
-          curl -s http://127.0.0.1:4040/api/tunnels | jq .
-          exit 1
-        fi
-        
-        # Parse host and port
-        NGROK_HOST=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f1)
-        NGROK_PORT=$(echo $NGROK_URL | sed 's|tcp://||' | cut -d':' -f2)
-        
+        echo "❌ Failed to get tunnel URL after 15 attempts"
+        echo "=== Ngrok API Response ==="
+        curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null | jq . || echo "No response"
+        echo "=== Ngrok Log ==="
+        cat ngrok.log
+        exit 1
+    
+    - name: Display connection info
+      run: |
         echo "=========================================="
         echo "🚀 SSH Tunnel Active!"
         echo "=========================================="
-        echo "Host: $NGROK_HOST"
-        echo "Port: $NGROK_PORT"
+        echo "Host: ${{ steps.tunnel.outputs.NGROK_HOST }}"
+        echo "Port: ${{ steps.tunnel.outputs.NGROK_PORT }}"
         echo "User: runner"
         echo ""
         echo "📋 Connect with:"
-        echo "ssh runner@$NGROK_HOST -p $NGROK_PORT"
+        echo "ssh runner@${{ steps.tunnel.outputs.NGROK_HOST }} -p ${{ steps.tunnel.outputs.NGROK_PORT }}"
         echo "=========================================="
         echo "⏰ Active until: $(date -d '+5 hours 50 minutes' '+%Y-%m-%d %H:%M:%S UTC')"
         echo "=========================================="
-        
-        # Save to file untuk step berikutnya
-        echo "NGROK_HOST=$NGROK_HOST" >> $GITHUB_ENV
-        echo "NGROK_PORT=$NGROK_PORT" >> $GITHUB_ENV
     
     - name: Send Telegram notification
-      if: success()
+      if: success() && secrets.TELEGRAM_BOT_TOKEN != ''
       run: |
         MESSAGE="🚀 <b>SSH Server Ready!</b>%0A%0A"
-        MESSAGE="${MESSAGE}🖥 <b>Host:</b> <code>${NGROK_HOST}</code>%0A"
-        MESSAGE="${MESSAGE}🔌 <b>Port:</b> <code>${NGROK_PORT}</code>%0A"
+        MESSAGE="${MESSAGE}🖥 <b>Host:</b> <code>${{ steps.tunnel.outputs.NGROK_HOST }}</code>%0A"
+        MESSAGE="${MESSAGE}🔌 <b>Port:</b> <code>${{ steps.tunnel.outputs.NGROK_PORT }}</code>%0A"
         MESSAGE="${MESSAGE}👤 <b>User:</b> <code>runner</code>%0A%0A"
-        MESSAGE="${MESSAGE}📋 <b>Command:</b>%0A<code>ssh runner@${NGROK_HOST} -p ${NGROK_PORT}</code>%0A%0A"
+        MESSAGE="${MESSAGE}📋 <b>Command:</b>%0A<code>ssh runner@${{ steps.tunnel.outputs.NGROK_HOST }} -p ${{ steps.tunnel.outputs.NGROK_PORT }}</code>%0A%0A"
         MESSAGE="${MESSAGE}⏰ Active for ~5h 50m"
         
         curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
           -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
           -d "text=$MESSAGE" \
-          -d "parse_mode=HTML" > /dev/null
+          -d "parse_mode=HTML"
         
         echo "✅ Telegram notification sent!"
       continue-on-error: true
     
     - name: Keep tunnel alive
       run: |
-        echo "Keeping tunnel alive for 5h 50m..."
+        echo "🔄 Keeping tunnel alive for 5h 50m..."
         
         END_TIME=$(($(date +%s) + 21000))
-        COUNTER=0
         
         while [ $(date +%s) -lt $END_TIME ]; do
-          COUNTER=$((COUNTER + 1))
+          REMAINING=$((($END_TIME - $(date +%s)) / 60))
+          echo "[$(date '+%H:%M:%S')] ✅ Tunnel active - ${REMAINING} minutes remaining"
           
-          # Check setiap 5 menit
-          if [ $((COUNTER % 60)) -eq 0 ]; then
-            REMAINING=$((($END_TIME - $(date +%s)) / 60))
-            echo "[$(date '+%H:%M:%S')] ✅ Tunnel active - ${REMAINING} minutes remaining"
-            
-            # Verify tunnel masih hidup
-            if ! curl -s http://127.0.0.1:4040/api/tunnels | jq -e '.tunnels[0]' > /dev/null 2>&1; then
-              echo "⚠️  Tunnel down! Restarting ngrok..."
-              pkill ngrok
-              sleep 5
-              ngrok tcp 22 --log=stdout > ngrok.log &
-              sleep 10
-            fi
+          # Health check setiap loop
+          if ! curl -s http://127.0.0.1:4040/api/tunnels | jq -e '.tunnels[0]' > /dev/null 2>&1; then
+            echo "⚠️ Tunnel lost! Attempting restart..."
+            pkill ngrok
+            sleep 5
+            ngrok tcp 22 --log=stdout > ngrok.log 2>&1 &
+            sleep 10
           fi
           
-          sleep 5
+          sleep 300  # Check every 5 minutes
         done
         
-        echo "⏰ Session time limit reached"
+        echo "⏰ Session completed"
     
     - name: Cleanup
       if: always()
       run: |
-        echo "Stopping ngrok..."
+        echo "🧹 Cleaning up..."
         pkill ngrok || true
-        echo "✅ Cleanup complete"
+        echo "✅ Done"
